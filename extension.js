@@ -10,7 +10,7 @@ import Cogl from 'gi://Cogl';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Volume from 'resource:///org/gnome/shell/ui/status/volume.js';
 
-import {Players} from './players.js';
+import {Players, stopArtDownloads} from './players.js';
 import {buildLabel} from './label.js';
 
 let indicator = null;
@@ -628,6 +628,7 @@ class MprisLabel extends PanelMenu.Button {
 		this.box.remove_child(this.label);
 		this.remove_child(this.box);
 		this._removeTimeout();
+		stopArtDownloads();
 
 		if (this._scheduledActionTimeout){
 			GLib.Source.remove(this._scheduledActionTimeout);

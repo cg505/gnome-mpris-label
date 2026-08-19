@@ -1,6 +1,8 @@
 import Gio from 'gi://Gio';
 import GioUnix from 'gi://GioUnix';
+import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
+import Soup from 'gi://Soup?version=3.0';
 import St from 'gi://St';
 
 const mprisInterface = `
@@ -44,6 +46,119 @@ const dBusInterface = `
 		</signal>
 	</interface>
 </node>`
+
+// St resolves CSS background-image URLs with synchronous GIO I/O on the
+// compositor's paint path. A remote artUrl (e.g. Spotify's https://i.scdn.co/...)
+// gets routed through gvfsd-http and can block gnome-shell indefinitely,
+// freezing the entire desktop. Remote art must therefore be downloaded
+// asynchronously into a local cache first; only local paths may reach an St style.
+const ART_CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(),'mpris-label','album-art']);
+const ART_DOWNLOAD_TIMEOUT = 15;//seconds, per-connection stall timeout
+const ART_RETRY_COOLDOWN = 300000;//milliseconds between retries of a failed url
+const ART_CACHE_MAX_AGE_DAYS = 30;
+
+let artSession = null;
+const artDownloadsInFlight = new Set();
+const artDownloadsFailed = new Map();//url -> timestamp of last failure
+
+function getLocalArtUrl(url){
+	const scheme = GLib.uri_parse_scheme(url);
+
+	if(scheme == null || scheme == 'file' || scheme == 'resource')
+		return url
+
+	if(scheme != 'http' && scheme != 'https')
+		return null //can't load this safely, treat as "no art"
+
+	const filename = GLib.compute_checksum_for_string(GLib.ChecksumType.SHA256,url,-1);
+	const cachePath = GLib.build_filenamev([ART_CACHE_DIR,filename]);
+
+	if(GLib.file_test(cachePath,GLib.FileTest.EXISTS))
+		return 'file://' + cachePath
+
+	downloadArt(url,cachePath);
+	return null //show the fallback icon until the download lands in the cache
+}
+
+function downloadArt(url,cachePath){
+	if(artDownloadsInFlight.has(url))
+		return
+
+	const failedAt = artDownloadsFailed.get(url);
+	if(failedAt && new Date().getTime() - failedAt < ART_RETRY_COOLDOWN)
+		return
+
+	const message = Soup.Message.new('GET',url);
+	if(!message){
+		artDownloadsFailed.set(url,new Date().getTime());
+		return
+	}
+
+	if(!artSession){
+		artSession = new Soup.Session({timeout: ART_DOWNLOAD_TIMEOUT});
+		pruneArtCache();
+	}
+
+	artDownloadsInFlight.add(url);
+	artSession.send_and_read_async(message,GLib.PRIORITY_DEFAULT,null,(session,result) => {
+		artDownloadsInFlight.delete(url);
+		try{
+			const bytes = session.send_and_read_finish(result);
+
+			if(message.get_status() != Soup.Status.OK || !bytes || bytes.get_size() == 0)
+				throw new Error('HTTP status ' + message.get_status());
+
+			GLib.mkdir_with_parents(ART_CACHE_DIR,0o700);
+			GLib.file_set_contents(cachePath,bytes.get_data());
+			artDownloadsFailed.delete(url);
+		}
+		catch(err){
+			if(!(err instanceof GLib.Error && err.matches(Gio.io_error_quark(),Gio.IOErrorEnum.CANCELLED))){
+				artDownloadsFailed.set(url,new Date().getTime());
+				log('Mpris Label: album art download failed: ' + err);
+			}
+		}
+	});
+}
+
+function pruneArtCache(){
+	const dir = Gio.File.new_for_path(ART_CACHE_DIR);
+	dir.enumerate_children_async('standard::name,time::modified',Gio.FileQueryInfoFlags.NONE,GLib.PRIORITY_LOW,null,(source,result) => {
+		let enumerator;
+		try{
+			enumerator = source.enumerate_children_finish(result);
+		}
+		catch{
+			return //cache dir doesn't exist yet
+		}
+
+		const cutoff = new Date().getTime()/1000 - ART_CACHE_MAX_AGE_DAYS*86400;
+		enumerator.next_files_async(1000,GLib.PRIORITY_LOW,null,(enumSource,enumResult) => {
+			let infos = [];
+			try{
+				infos = enumSource.next_files_finish(enumResult);
+			}
+			catch{
+				; //do nothing
+			}
+			infos.forEach(info => {
+				const modified = info.get_modification_date_time();
+				if(modified && modified.to_unix() < cutoff)
+					dir.get_child(info.get_name()).delete_async(GLib.PRIORITY_LOW,null,null);
+			});
+			enumerator.close_async(GLib.PRIORITY_LOW,null,null);
+		});
+	});
+}
+
+export function stopArtDownloads(){
+	if(artSession){
+		artSession.abort();
+		artSession = null;
+	}
+	artDownloadsInFlight.clear();
+	artDownloadsFailed.clear();
+}
 
 export var Players = class Players {
 	constructor(settings){
@@ -241,8 +356,13 @@ class Player {
 	}
 	getArtUrlIcon(size,radius){
 		const url = this.stringFromMetadata("mpris:artUrl",this.metadata);
+		let localUrl = null;
 
-		if(url.length>0){
+		if(url.length>0)
+			localUrl = getLocalArtUrl(url);//never returns a remote url (see above)
+
+		if(localUrl){
+			const cssUrl = localUrl.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
 			let innerArt = new St.Bin({
 				style: `
 					border-radius: ${radius}px;
@@ -250,7 +370,7 @@ class Player {
 					padding: 0px;
 					width: ${size}px;
 					height: ${size}px;
-					background-image: url('${url}');
+					background-image: url('${cssUrl}');
 					background-size: cover;
 					background-position: center;
 				`,
